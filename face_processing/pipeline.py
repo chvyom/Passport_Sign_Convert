@@ -1,15 +1,26 @@
+import os
 import cv2
-from detection import FaceDetector
-from bg_changer import PassportBackgroundChanger
-from framing import FaceFramer
-from resizer import PassportResizer
+from .detection import FaceDetector
+from .bg_changer import PassportBackgroundChanger
+from .framing import FaceFramer
+from .resizer import PassportResizer
 
 
 class FaceProcessingPipeline:
 
     def __init__(self):
-        self.detector = FaceDetector()
-        self.bg_changer = PassportBackgroundChanger()
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # 2. Build absolute paths for BOTH model files
+        face_model_path = os.path.join(current_dir, "blaze_face_full_range.tflite")
+        segmenter_model_path = os.path.join(current_dir, "selfie_segmenter.tflite")
+        
+        # 3. Pass the paths into their respective constructors
+        self.detector = FaceDetector(model_path=face_model_path)
+        
+        # Note: Ensure your PassportBackgroundChanger accepts a model_path parameter
+        self.bg_changer = PassportBackgroundChanger(model_path=segmenter_model_path)
+        
         self.framer = FaceFramer()
         self.resizer = PassportResizer()
 
