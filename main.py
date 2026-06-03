@@ -1,10 +1,10 @@
 import sys
 import os
 import cv2
-import customtkinter as ctk
-from tkinter import filedialog
-
 import numpy as np
+import customtkinter as ctk
+import threading
+from tkinter import filedialog
 
 # Force clean light theme styles globally
 ctk.set_appearance_mode("Light")
@@ -18,10 +18,10 @@ class ImageProcessingStudio(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        # --- Window Window Geometry Setup ---
+        # --- Window Geometry Setup ---
         self.title("Passport Document Processor")
         self.geometry("900x700")
-        self.configure(fg_color="#F4F6F9")  # Off-white background canvas
+        self.configure(fg_color="#F4F6F9")
 
         # --- Core Logic Instantiations ---
         self.face_processor = FaceProcessingPipeline()
@@ -156,8 +156,16 @@ class ImageProcessingStudio(ctk.CTk):
             self.output_entry.delete(0, "end")
             self.output_entry.insert(0, folder)
 
+    def update_status(self, text, bg_color="#F8FAFC", border_color="#E2E8F0", text_color="#475569"):
+        """Pure UI Method: Updates the notification text and theme colors safely."""
+        self.after(0, lambda: self._safe_update_status(text, bg_color, border_color, text_color))
+
+    def _safe_update_status(self, text, bg_color, border_color, text_color):
+        self.status_box.configure(fg_color=bg_color, border_color=border_color)
+        self.status_text.configure(text=text, text_color=text_color)
+
     def run_pipeline(self):
-        """Main processing flow containing intelligent branch-routing rules."""
+        """Pure UI Method: Validates entry fields and toggles thread state."""
         input_folder = self.input_entry.get().strip()
         base_output = self.output_entry.get().strip()
 
@@ -165,77 +173,141 @@ class ImageProcessingStudio(ctk.CTk):
             self.update_status("⚠️ Please select valid input and output directory paths.", "#FEF2F2", "#EF4444", "#DC2626")
             return
 
-        # Explicit Sub-Folder Branch Generation
-        face_folder = os.path.join(base_output, "faces")
-        sign_folder = os.path.join(base_output, "signatures")
-        error_folder = os.path.join(base_output, "errors")
-
-        for folder in [face_folder, sign_folder, error_folder]:
-            os.makedirs(folder, exist_ok=True)
-
-        supported_extensions = ('.jpg', '.jpeg', '.png', '.bmp')
-        files = [f for f in os.listdir(input_folder) if f.lower().endswith(supported_extensions)]
-
-        if not files:
-            self.update_status("⚠️ No valid image files found in the source directory.", "#FFFBEB", "#F59E0B", "#B45309")
-            return
-
         self.start_btn.configure(state="disabled", text="Processing & Sorting Images...")
+        threading.Thread(target=self._worker_process, args=(input_folder, base_output), daemon=True).start()
+    
+    def _worker_process(self, input_folder, base_output):
+        """Process all images and route them to face/signature pipelines."""
+        try:
+            face_folder = os.path.join(base_output, "faces")
+            sign_folder = os.path.join(base_output, "signatures")
+            error_folder = os.path.join(base_output, "errors")
 
-        for idx, file_name in enumerate(files, 1):
-            self.update_status(f"⏳ Classifying and Processing [{idx}/{len(files)}]: {file_name}", "#F8FAFC", "#E2E8F0", "#475569")
-            file_path = os.path.join(input_folder, file_name)
+            for folder in [face_folder, sign_folder, error_folder]:
+                os.makedirs(folder, exist_ok=True)
 
-            try:
-                image = cv2.imread(file_path)
-                if image is None:
-                    # Unreadable file corruption fallback
-                    cv2.imwrite(os.path.join(error_folder, file_name), cv2.imread(file_path) if cv2.imread(file_path) is not None else np.zeros((100,100,3)))
-                    continue
+            supported_extensions = (".jpg", ".jpeg", ".png", ".bmp")
 
-                # --- STEP 1: PRE-SCREEN WITH FACE DETECTION LAYER ---
-                face_bbox = self.face_processor.detector.detect_face(image)
-                
-                if face_bbox is not None:
-                    # It's an image containing a face. Route exclusively to the face pipeline.
-                    face_result = self.face_processor.process_image(image)
-                    if face_result is not None:
-                        cv2.imwrite(os.path.join(face_folder, file_name), face_result)
-                    else:
-                        # Face detection found a face box, but cropping/background formatting steps failed
-                        cv2.imwrite(os.path.join(error_folder, f"failed_face_{file_name}"), image)
-                    
-                    self.update()
-                    continue  # Successfully handled as a face image. Skip to next file.
+            files = [
+                f for f in os.listdir(input_folder)
+                if f.lower().endswith(supported_extensions)
+            ]
 
-                # --- STEP 2: ALTERNATE ROUTE TO SIGNATURE VALIDATOR ---
-                success, log_msg, sign_result = self.sign_processor.verify_and_process(file_path)
-                
-                if success and sign_result is not None and sign_result.size > 0:
-                    # It's a valid signature document. Save to signatures folder.
-                    cv2.imwrite(os.path.join(sign_folder, file_name), sign_result)
-                else:
-                    # Failed both face and signature structure verification layers -> Send to errors directory
-                    cv2.imwrite(os.path.join(error_folder, file_name), image)
+            if not files:
+                self.update_status(
+                    "⚠️ No valid image files found in the source directory.",
+                    "#FFFBEB",
+                    "#F59E0B",
+                    "#B45309"
+                )
+                self.after(0, lambda: self.start_btn.configure(state="normal", text="Start Processing"))
+                return
 
-                self.update()
+            face_count = 0
+            sign_count = 0
+            error_count = 0
 
-            except Exception as e:
-                print(f"Exception handling {file_name}: {str(e)}")
-                # Any runtime execution failure dumps the original image into the errors bucket safely
+            for idx, file_name in enumerate(files, 1):
+                self.update_status(
+                    f"⏳ Processing [{idx}/{len(files)}]: {file_name}",
+                    "#F8FAFC",
+                    "#E2E8F0",
+                    "#475569"
+                )
+
+                file_path = os.path.join(input_folder, file_name)
+
                 try:
-                    cv2.imwrite(os.path.join(error_folder, f"broken_{file_name}"), cv2.imread(file_path))
-                except:
-                    pass
+                    image = cv2.imread(file_path)
+                    if image is None:
+                        raise ValueError("Empty or unreadable image frame data.")
 
-        self.update_status("✅ Sorting Complete!\nFiles split clean into /faces, /signatures, and /errors directories.", "#F0FDF4", "#DCFCE7", "#15803D")
-        self.start_btn.configure(state="normal", text="Start Processing")
+                    # Flag to track if image was successfully processed
+                    processed = False
 
-    def update_status(self, message, bg_color, border_color, text_color):
-        self.status_box.configure(fg_color=bg_color, border_color=border_color)
-        self.status_text.configure(text=message, text_color=text_color)
-        self.update()
+                    # 1. FACE PIPELINE ATTEMPT
+                    try:
+                        if hasattr(self.face_processor, 'detector') and hasattr(self.face_processor.detector, 'detect_face'):
+                            face_bbox = self.face_processor.detector.detect_face(image)
+                        else:
+                            face_bbox = None
+                            
+                        if face_bbox is not None:
+                            face_result = self.face_processor.process_image(image)
+                            if face_result is not None:
+                                output_path = os.path.join(face_folder, file_name)
+                                cv2.imwrite(output_path, face_result)
+                                processed = True
+                                face_count += 1
+                                print(f"✓ Face detected and saved: {file_name}")
+                                continue
+                    except Exception as e:
+                        print(f"Face processing error for {file_name}: {e}")
 
-if __name__ == "__main__":
+                    # 2. SIGNATURE PIPELINE ATTEMPT - Using the correct verify_and_process method
+                    if not processed:
+                        try:
+                            # Call the verify_and_process method from sign.py
+                            success, message, processed_image = self.sign_processor.verify_and_process(file_path)
+                            
+                            if success and processed_image is not None:
+                                # Save the processed signature image
+                                output_path = os.path.join(sign_folder, file_name)
+                                cv2.imwrite(output_path, processed_image)
+                                processed = True
+                                sign_count += 1
+                                print(f"✓ Signature detected and processed: {file_name} - {message}")
+                                continue
+                            else:
+                                print(f"Signature detection failed for {file_name}: {message}")
+                                
+                        except Exception as e:
+                            print(f"Signature processing error for {file_name}: {e}")
+
+                    # 3. ROUTE TO ERROR IF UNIDENTIFIABLE
+                    if not processed:
+                        output_path = os.path.join(error_folder, file_name)
+                        cv2.imwrite(output_path, image)
+                        error_count += 1
+                        print(f"✗ Unrecognized image type, saved to errors: {file_name}")
+
+                except Exception as e:
+                    print(f"File processing error: {file_name} -> {e}")
+                    error_count += 1
+                    # Save raw file copy to error route
+                    try:
+                        if 'image' in locals() and image is not None:
+                            cv2.imwrite(os.path.join(error_folder, file_name), image)
+                        else:
+                            import shutil
+                            shutil.copy2(file_path, os.path.join(error_folder, file_name))
+                    except Exception as copy_error:
+                        print(f"Failed to save error file {file_name}: {copy_error}")
+
+            # Final success status with counts
+            self.update_status(
+                f"✅ Processing complete! Faces: {face_count} | Signatures: {sign_count} | Errors: {error_count}",
+                "#F0FDF4",
+                "#22C55E",
+                "#166534"
+            )
+            
+        except Exception as e:
+            self.update_status(
+                f"❌ Critical error during processing: {str(e)}",
+                "#FEF2F2",
+                "#EF4444",
+                "#DC2626"
+            )
+            print(f"Worker process critical error: {e}")
+        
+        finally:
+            # Re-enable the start button
+            self.after(0, lambda: self.start_btn.configure(state="normal", text="Start Processing"))
+
+def main():
     app = ImageProcessingStudio()
     app.mainloop()
+
+if __name__ == "__main__":
+    main()

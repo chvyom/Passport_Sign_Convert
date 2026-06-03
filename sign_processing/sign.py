@@ -1,138 +1,349 @@
 import cv2
 import numpy as np
 import os
-from typing import Tuple
-import onnxruntime as ort
+from skimage.measure import label, regionprops
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YOLOv8 ONNX — PRIMARY DETECTOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_yolo_model(model_path: str):
+    """Load the YOLOv8 ONNX model with ONNXRuntime. Returns session or None."""
+    try:
+        import onnxruntime as ort
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        session = ort.InferenceSession(model_path, providers=providers)
+        print(f"✅ YOLO model loaded: {model_path}")
+        return session
+    except Exception as e:
+        print(f"⚠️  Could not load ONNX model ({e}). Will use statistical fallback.")
+        return None
+
+
+def preprocess_for_yolo(img_bgr: np.ndarray, input_size: int = 640):
+    """
+    Letterbox-resize to input_size × input_size, normalize to [0,1],
+    convert HWC-BGR → CHW-RGB, add batch dim.
+    Returns (blob, scale, pad_x, pad_y).
+    """
+    h, w = img_bgr.shape[:2]
+    scale = min(input_size / h, input_size / w)
+    nh, nw = int(round(h * scale)), int(round(w * scale))
+
+    resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+    pad_x = (input_size - nw) // 2
+    pad_y = (input_size - nh) // 2
+
+    canvas = np.full((input_size, input_size, 3), 114, dtype=np.uint8)
+    canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
+
+    blob = canvas[:, :, ::-1].astype(np.float32) / 255.0   # BGR→RGB, normalise
+    blob = np.transpose(blob, (2, 0, 1))[np.newaxis]        # HWC → 1CHW
+    return blob, scale, pad_x, pad_y
+
+
+def postprocess_yolo(output: np.ndarray, scale: float, pad_x: int, pad_y: int,
+                     orig_h: int, orig_w: int,
+                     conf_threshold: float = 0.25, iou_threshold: float = 0.45):
+    """
+    YOLOv8 raw output shape: [1, 5, num_anchors]  (x_c, y_c, w, h, conf).
+    Returns list of (x1, y1, x2, y2, confidence) in original-image pixels.
+    """
+    preds = output[0]           # → [5, num_anchors]
+    preds = preds.T             # → [num_anchors, 5]
+
+    boxes_xywh = preds[:, :4]
+    confs      = preds[:, 4]
+
+    keep = confs >= conf_threshold
+    boxes_xywh = boxes_xywh[keep]
+    confs       = confs[keep]
+
+    if len(confs) == 0:
+        return []
+
+    # Convert cx, cy, w, h (letterbox space) → x1y1x2y2 (original image space)
+    cx, cy, bw, bh = boxes_xywh[:, 0], boxes_xywh[:, 1], boxes_xywh[:, 2], boxes_xywh[:, 3]
+    x1 = (cx - bw / 2 - pad_x) / scale
+    y1 = (cy - bh / 2 - pad_y) / scale
+    x2 = (cx + bw / 2 - pad_x) / scale
+    y2 = (cy + bh / 2 - pad_y) / scale
+
+    x1 = np.clip(x1, 0, orig_w)
+    y1 = np.clip(y1, 0, orig_h)
+    x2 = np.clip(x2, 0, orig_w)
+    y2 = np.clip(y2, 0, orig_h)
+
+    # NMS
+    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
+    indices = cv2.dnn.NMSBoxes(
+        bboxes=boxes_xyxy.tolist(),
+        scores=confs.tolist(),
+        score_threshold=conf_threshold,
+        nms_threshold=iou_threshold,
+    )
+
+    results = []
+    if len(indices) > 0:
+        for i in np.array(indices).flatten():
+            results.append((
+                int(x1[i]), int(y1[i]), int(x2[i]), int(y2[i]), float(confs[i])
+            ))
+        results.sort(key=lambda r: r[4], reverse=True)   # highest confidence first
+
+    return results
+
+
+def detect_with_yolo(session, image_path: str, conf_threshold: float = 0.25):
+    """
+    Run YOLOv8 inference on one image.
+    Returns (x, y, crop_w, crop_h) of the best detection, or None.
+    """
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+
+    h, w = img.shape[:2]
+    blob, scale, pad_x, pad_y = preprocess_for_yolo(img)
+
+    input_name = session.get_inputs()[0].name
+    raw_output = session.run(None, {input_name: blob})
+
+    detections = postprocess_yolo(
+        raw_output[0], scale, pad_x, pad_y, h, w, conf_threshold
+    )
+
+    if not detections:
+        return None
+
+    x1, y1, x2, y2, conf = detections[0]   # best detection
+    print(f"   🎯 YOLO detected signature  conf={conf:.2f}  box=({x1},{y1},{x2},{y2})")
+    return (x1, y1, x2 - x1, y2 - y1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STATISTICAL FALLBACK — original sign.py logic
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_signature_detect_logic(image_path, outlier_weight=3.0, outlier_bias=100,
+                                amplifier=15, min_area_size=10):
+    """
+    HSV-mask + skimage region-labeling fallback.
+    Returns (x, y, crop_w, crop_h) or None.
+    """
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+
+    h, w = img.shape[:2]
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    low_threshold  = np.array([0,   0,   0])
+    high_threshold = np.array([180, 255, 200])
+    mask = cv2.inRange(hsv, low_threshold, high_threshold)
+
+    labeled_mask = label(mask)
+    regions = regionprops(labeled_mask)
+
+    if not regions:
+        return None
+
+    total_pixels, nb_regions, valid_regions = 0, 0, []
+    for prop in regions:
+        if prop.area >= min_area_size:
+            total_pixels += prop.area
+            nb_regions   += 1
+            valid_regions.append(prop)
+
+    if nb_regions == 0:
+        return None
+
+    average_size       = total_pixels / nb_regions
+    small_size_outlier = average_size * outlier_weight + outlier_bias
+    big_size_outlier   = small_size_outlier * amplifier
+
+    x_min, y_min = w, h
+    x_max, y_max = 0, 0
+    strokes_found = False
+
+    for prop in valid_regions:
+        if small_size_outlier <= prop.area <= big_size_outlier:
+            minr, minc, maxr, maxc = prop.bbox
+            x_min = min(x_min, minc)
+            y_min = min(y_min, minr)
+            x_max = max(x_max, maxc)
+            y_max = max(y_max, maxr)
+            strokes_found = True
+
+    if strokes_found:
+        return (x_min, y_min, x_max - x_min, y_max - y_min)
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE CROP + ENHANCE HELPER  (shared by both the class and standalone use)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _crop_and_enhance(img: np.ndarray, box) -> np.ndarray:
+    """
+    Given a source BGR image and a (x, y, cw, ch) box (or None for full-frame),
+    apply margin padding, 1.2× upscale, and bilateral smoothing.
+    Returns the final enhanced BGR array.
+    """
+    h, w = img.shape[:2]
+
+    if box is None:
+        x, y, cw, ch = 0, 0, w, h
+    else:
+        x, y, cw, ch = box
+
+    margin_w = int(cw * 0.05) if w > 500 else 8
+    margin_h = int(ch * 0.05) if h > 500 else 8
+
+    x1 = max(0, x - margin_w)
+    y1 = max(0, y - margin_h)
+    x2 = min(w, x + cw + margin_w)
+    y2 = min(h, y + ch + margin_h)
+
+    cropped = img[y1:y2, x1:x2]
+    if cropped.size == 0:
+        cropped = img
+
+    scale  = 1.2
+    new_w  = int(cropped.shape[1] * scale)
+    new_h  = int(cropped.shape[0] * scale)
+    resized = cv2.resize(cropped, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    return cv2.bilateralFilter(resized, 5, 25, 25)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PureSignatureValidator — interface consumed by main.py
+# ─────────────────────────────────────────────────────────────────────────────
 
 class PureSignatureValidator:
-    def __init__(self, model_filename: str = "yolov8s.onnx"):
+    """
+    Drop-in class for main.py.
+
+    Usage:
+        validator = PureSignatureValidator(model_path="yolov8s.onnx")
+        success, log_msg, result_img = validator.verify_and_process(file_path)
+
+    Returns:
+        success   (bool)        – True if a signature region was confidently found
+        log_msg   (str)         – Human-readable status string for logging/UI
+        result_img (np.ndarray) – Enhanced crop (or full frame as fallback); never None
+                                  unless the file itself could not be read.
+    """
+
+    def __init__(self, model_path: str = None, conf_threshold: float = 0.25):
+        # Resolve model path: explicit arg → env var → sibling file
+        if model_path is None:
+            model_path = os.environ.get(
+                "MODEL_PATH",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov8s.onnx")
+            )
+        self.conf_threshold = conf_threshold
+        self.session = load_yolo_model(model_path)   # None if unavailable
+
+    # ------------------------------------------------------------------
+    def verify_and_process(self, image_path: str):
         """
-        Hybrid AI + Structural Edge Bypass Engine.
-        Guarantees validation even if the AI model fails to find a bounding box.
+        Detect, crop, and enhance the signature in *image_path*.
+
+        Returns (success: bool, log_msg: str, result_img: np.ndarray | None).
         """
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        self.model_path = os.path.join(current_dir, model_filename)
+        img = cv2.imread(image_path)
+        if img is None:
+            return False, f"❌ Cannot read image: {image_path}", None
 
-        if not os.path.exists(self.model_path):
-            raise FileNotFoundError(f"CRITICAL: '{model_filename}' not found.")
+        h, w = img.shape[:2]
+        box         = None
+        success     = False
+        method_used = "whole-frame"
 
-        self.session = ort.InferenceSession(self.model_path, providers=['CPUExecutionProvider'])
-        self.input_name = self.session.get_inputs()[0].name
-        self.input_width = 640
-        self.input_height = 640
+        # ── 1. YOLOv8 ────────────────────────────────────────────────────────
+        if self.session is not None:
+            box = detect_with_yolo(self.session, image_path, self.conf_threshold)
+            if box is not None:
+                success     = True
+                method_used = "YOLO"
 
-    def verify_and_process(self, image_path: str, margin: int = 15) -> Tuple[bool, str, np.ndarray]:
-        if not os.path.exists(image_path):
-            return False, "CRITICAL: Input file does not exist.", np.array([])
+        # ── 2. Statistical fallback ──────────────────────────────────────────
+        if box is None:
+            box = run_signature_detect_logic(image_path)
+            if box is not None:
+                success     = True
+                method_used = "statistical"
 
-        try:
-            with open(image_path, "rb") as f:
-                img = cv2.imdecode(np.frombuffer(f.read(), dtype=np.uint8), cv2.IMREAD_COLOR)
-            if img is None or img.size == 0:
-                return False, "CRITICAL: Unreadable image structure.", np.array([])
-        except Exception as e:
-            return False, f"CRITICAL: Hardware read error: {str(e)}", np.array([])
+        # ── 3. Whole-frame last resort ───────────────────────────────────────
+        if box is None:
+            box         = (0, 0, w, h)
+            success     = False       # no real detection; flag caller
+            method_used = "whole-frame"
 
-        img_h, img_w = img.shape[:2]
+        result_img = _crop_and_enhance(img, box)
+        log_msg    = f"[{method_used}] {'detected' if success else 'no detection — full frame used'}"
+        return success, log_msg, result_img
 
-        # --- STEP 1: RUN COMPUTER VISION FALLBACK IN PARALLEL ---
-        # This isolates the exact coordinates of the ink strokes natively
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Threshold to catch dark ink on light background
-        _, thresh = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        cv_x1, cv_y1, cv_x2, cv_y2 = img_w, img_h, 0, 0
-        has_ink_structure = False
-        
-        for c in contours:
-            cx, cy, cw, ch = cv2.boundingRect(c)
-            # Ignore isolated noise specks smaller than 4x4 pixels
-            if cw > 4 and ch > 4:
-                has_ink_structure = True
-                cv_x1 = min(cv_x1, cx)
-                cv_y1 = min(cv_y1, cy)
-                cv_x2 = max(cv_x2, cx + cw)
-                cv_y2 = max(cv_y2, cy + ch)
 
-        # --- STEP 2: PRE-PROCESS & RUN AI INFERENCE ---
-        input_img = cv2.resize(img, (self.input_width, self.input_height))
-        input_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
-        input_img = input_img.transpose(2, 0, 1)
-        input_img = np.expand_dims(input_img, axis=0).astype(np.float32) / 255.0
+# ─────────────────────────────────────────────────────────────────────────────
+# STANDALONE ENTRY POINT  (python sign.py)
+# ─────────────────────────────────────────────────────────────────────────────
 
-        outputs = self.session.run(None, {self.input_name: input_img})
-        predictions = np.squeeze(outputs)
-        
-        if len(predictions.shape) == 2 and predictions.shape[0] < predictions.shape[1]:
-            predictions = predictions.T
+def process_signature(image_path: str, session, output_folder: str = "output",
+                      conf_threshold: float = 0.25):
+    """Standalone helper that saves the result to disk (used by __main__)."""
+    img = cv2.imread(image_path)
+    if img is None:
+        print(f"❌ Cannot load {image_path}")
+        return False
 
-        conf_threshold = 0.25  
-        boxes = []
-        scores = []
+    h, w   = img.shape[:2]
+    box    = None
+    method = "whole-frame"
 
-        if len(predictions.shape) == 2 and predictions.shape[0] > 0:
-            x_centers = predictions[:, 0]
-            y_centers = predictions[:, 1]
-            widths = predictions[:, 2]
-            heights = predictions[:, 3]
-            confidences = np.max(predictions[:, 4:], axis=1)
+    if session is not None:
+        box = detect_with_yolo(session, image_path, conf_threshold)
+        if box:
+            method = "YOLO"
 
-            raw_indices = np.where(confidences > conf_threshold)
-            valid_indices = raw_indices[0] if len(raw_indices) > 0 else np.array([])
+    if box is None:
+        print(f"   ↩️  YOLO found nothing — trying statistical fallback …")
+        box = run_signature_detect_logic(image_path)
+        if box:
+            method = "statistical"
 
-            scale_w, scale_h = img_w / 640.0, img_h / 640.0
+    if box is None:
+        print(f"   ⚠️  No signature region found. Using whole frame.")
+        box = (0, 0, w, h)
 
-            for idx in valid_indices:
-                cx, cy, w, h = x_centers[idx], y_centers[idx], widths[idx], heights[idx]
-                x1 = int(np.round((cx - w / 2.0) * scale_w))
-                y1 = int(np.round((cy - h / 2.0) * scale_h))
-                x2 = int(np.round((cx + w / 2.0) * scale_w))
-                y2 = int(np.round((cy + h / 2.0) * scale_h))
-                boxes.append([x1, y1, x2 - x1, y2 - y1])
-                scores.append(float(confidences[idx]))
+    final_output = _crop_and_enhance(img, box)
 
-        # --- STEP 3: DECISION MATRIX ---
-        ai_detected = False
-        w_box, h_box, confidence = 0, 0, 0.0
+    os.makedirs(output_folder, exist_ok=True)
+    output_path = os.path.join(output_folder, f"DETECT_{os.path.basename(image_path)}")
+    cv2.imwrite(output_path, final_output)
+    print(f"   ✅ [{method}] saved → {output_path}")
+    return True
 
-        if boxes:
-            nms_indices = cv2.dnn.NMSBoxes(boxes, scores, score_threshold=conf_threshold, nms_threshold=0.45)
-            if len(nms_indices) > 0:
-                best_idx = int(nms_indices.flatten()[0]) if isinstance(nms_indices, np.ndarray) else int(nms_indices[0])
-                x_box, y_box, w_box, h_box = boxes[best_idx]
-                confidence = scores[best_idx]
-                ai_detected = True
 
-        # Use AI data if available; otherwise drop back to native contour coordinates
-        if ai_detected:
-            is_already_correct = (w_box > img_w * 0.35) and (h_box > img_h * 0.15)
-            if is_already_correct:
-                return True, f"VERIFIED (AI): Image is already a clear close-up signature (Conf: {confidence:.2f}).", img
-            x_min, y_min, x_max, y_max = x_box, y_box, x_box + w_box, y_box + h_box
-        elif has_ink_structure:
-            # Fallback path for when ONNX engine skips/misses clean white background images
-            cv_w = cv_x2 - cv_x1
-            cv_h = cv_y2 - cv_y1
-            is_already_correct = (cv_w > img_w * 0.35) and (cv_h > img_h * 0.15)
-            if is_already_correct:
-                return True, "VERIFIED (CV-Fallback): Image structural analysis confirms a valid close-up signature.", img
-            x_min, y_min, x_max, y_max = cv_x1, cv_y1, cv_x2, cv_y2
-        else:
-            return False, "VERIFICATION FAILED: No handwritten strokes or patterns found.", np.array([])
+if __name__ == "__main__":
+    current_folder = os.path.dirname(os.path.abspath(__file__))
+    model_path     = os.environ.get("MODEL_PATH",
+                                    os.path.join(current_folder, "yolov8s.onnx"))
+    test_folder    = os.path.join(current_folder, "test_images")
+    os.makedirs(test_folder, exist_ok=True)
 
-        # --- STEP 4: SAFE PADDED CROP & CLEANUP (For high-resolution canvas documents) ---
-        crop_margin = max(30, margin)
-        crop_x_min = max(0, x_min - crop_margin)
-        crop_y_min = max(0, y_min - crop_margin)
-        crop_x_max = min(img_w, x_max + crop_margin)
-        crop_y_max = min(img_h, y_max + crop_margin)
+    files = [f for f in os.listdir(test_folder)
+             if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))]
 
-        cropped_sig = img[crop_y_min:crop_y_max, crop_x_min:crop_x_max]
-
-        # White-balance background bleach transformation
-        bg_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31))
-        bg_map = cv2.dilate(cropped_sig, bg_kernel)
-        processed_output = cv2.divide(cropped_sig, bg_map, scale=255)
-
-        return True, "VERIFICATION SUCCESS: Signature isolated and background balanced.", processed_output
+    if not files:
+        print(f"📁 Put your images inside: {test_folder}")
+    else:
+        session = load_yolo_model(model_path)
+        print("=" * 60)
+        print("🔍 SIGNATURE DETECTION  (YOLOv8 → statistical fallback)")
+        print("=" * 60)
+        for file in files:
+            print(f"\n📷 {file}")
+            process_signature(os.path.join(test_folder, file), session)
