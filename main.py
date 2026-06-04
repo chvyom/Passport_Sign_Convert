@@ -6,6 +6,18 @@ import customtkinter as ctk
 import threading
 from tkinter import filedialog
 
+# Speed up TensorFlow
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+def resource_path(relative_path):
+    """Get absolute path to resource"""
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
 # Force clean light theme styles globally
 ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("blue")
@@ -222,7 +234,6 @@ class ImageProcessingStudio(ctk.CTk):
                     if image is None:
                         raise ValueError("Empty or unreadable image frame data.")
 
-                    # Flag to track if image was successfully processed
                     processed = False
 
                     # 1. FACE PIPELINE ATTEMPT
@@ -244,14 +255,12 @@ class ImageProcessingStudio(ctk.CTk):
                     except Exception as e:
                         print(f"Face processing error for {file_name}: {e}")
 
-                    # 2. SIGNATURE PIPELINE ATTEMPT - Using the correct verify_and_process method
+                    # 2. SIGNATURE PIPELINE ATTEMPT
                     if not processed:
                         try:
-                            # Call the verify_and_process method from sign.py
                             success, message, processed_image = self.sign_processor.verify_and_process(file_path)
                             
                             if success and processed_image is not None:
-                                # Save the processed signature image
                                 output_path = os.path.join(sign_folder, file_name)
                                 cv2.imwrite(output_path, processed_image)
                                 processed = True
@@ -274,7 +283,6 @@ class ImageProcessingStudio(ctk.CTk):
                 except Exception as e:
                     print(f"File processing error: {file_name} -> {e}")
                     error_count += 1
-                    # Save raw file copy to error route
                     try:
                         if 'image' in locals() and image is not None:
                             cv2.imwrite(os.path.join(error_folder, file_name), image)
@@ -302,11 +310,49 @@ class ImageProcessingStudio(ctk.CTk):
             print(f"Worker process critical error: {e}")
         
         finally:
-            # Re-enable the start button
             self.after(0, lambda: self.start_btn.configure(state="normal", text="Start Processing"))
 
 def main():
+    # Create and show loading window
+    loading = ctk.CTk()
+    loading.title("Loading...")
+    loading.geometry("400x250")
+    loading.configure(fg_color="#0F172A")
+    
+    # Center the loading window
+    loading.eval('tk::PlaceWindow . center')
+    
+    # Add loading elements
+    title = ctk.CTkLabel(loading, text="Passport Document Processor", font=("Arial", 20, "bold"), text_color="#FFFFFF")
+    title.pack(pady=(50, 20))
+    
+    status = ctk.CTkLabel(loading, text="Loading models, please wait...", font=("Arial", 12), text_color="#94A3B8")
+    status.pack(pady=10)
+    
+    progress = ctk.CTkProgressBar(loading, width=250, height=8)
+    progress.pack(pady=20)
+    progress.set(0)
+    
+    # Update display
+    loading.update()
+    
+    # Load models and create app (in same thread)
+    progress.set(0.3)
+    status.configure(text="Loading face detection...")
+    loading.update()
+    
+    # Create main app (this loads models)
     app = ImageProcessingStudio()
+    
+    progress.set(0.9)
+    status.configure(text="Starting application...")
+    loading.update()
+    
+    # Close loading window and show main app
+    loading.destroy()
+    
+    # Center and show main app
+    app.eval('tk::PlaceWindow . center')
     app.mainloop()
 
 if __name__ == "__main__":
